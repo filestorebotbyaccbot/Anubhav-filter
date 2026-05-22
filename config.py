@@ -3,9 +3,9 @@ import random
 
 # config.py
 
-API_ID = int(os.environ.get("API_ID", 28961091))
-API_HASH = os.environ.get("API_HASH", "fa3796dbdec1efdf151aca5f14815d06")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8439412197:AAHrIW_hH48tkimWzEZHivEOYOdQTcmmilM")
+API_ID = int(os.environ.get("API_ID", ))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # Search Settings
 DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID",-1003616654675))
