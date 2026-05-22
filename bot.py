@@ -37,13 +37,9 @@ async def channel_index_handler(client, message):
 
     await add_file(file_id, file_name, message.caption, message_id=message.id, channel_id=DB_CHANNEL_ID)
 
-# Callback routing - handlers are now in plugins
-# But centralized f# stays here for stability across all modes.
-
 # Centralized File Delivery Callback
 @bot.on_callback_query(filters.regex(r"^sall#"))
 async def send_all_callback_handler(client, cb):
-    # Force Subscribe Check
     if not await force_sub(client, cb.message, user_id=cb.from_user.id):
         return
 
@@ -77,7 +73,6 @@ async def send_all_callback_handler(client, cb):
         except Exception as e:
             print(f"Batch Send Error: {e}")
 
-    # Handle Auto-Delete
     delay = parse_duration(AUTO_DELETE_TIME)
     if delay > 0:
         readable_time = AUTO_DELETE_TIME.replace("s", " Seconds").replace("m", " Minutes").replace("h", " Hours").replace("d", " Days")
@@ -89,7 +84,6 @@ async def send_all_callback_handler(client, cb):
 
 @bot.on_callback_query(filters.regex(r"^f#"))
 async def file_callback_handler(client, cb):
-    # Force Subscribe Check
     if not await force_sub(client, cb.message, user_id=cb.from_user.id):
         return
 
@@ -103,11 +97,9 @@ async def file_callback_handler(client, cb):
     caption = file_info.get('caption') or file_name
 
     try:
-        # Send file directly to user
         m = await client.send_document(chat_id=cb.message.chat.id, document=file_id, caption=caption)
         await cb.answer()
 
-        # Handle Auto-Delete
         delay = parse_duration(AUTO_DELETE_TIME)
         if delay > 0:
             sent_msg_ids = [cb.message.id, m.id]
@@ -122,18 +114,28 @@ async def file_callback_handler(client, cb):
         print(f"File Send Error: {e}")
         await cb.answer("Error sending file", show_alert=True)
 
+
+# --- FIX APPLIED HERE ---
+async def main():
+    print(f"DEBUG: Active DB_CHANNEL_ID = {DB_CHANNEL_ID}")
+    
+    # Start Pyrogram client asynchronously
+    await bot.start()
+    
+    try:
+        await bot.send_message(OWNER_ID, f"**bot started successfully with ForceSub & Web Service ✅**\n\n**Configured Channel ID:** `{DB_CHANNEL_ID}`")
+    except Exception:
+        pass
+        
+    # Keep the bot running asynchronously 
+    await idle()
+    
+    # Gracefully stop the bot if the process receives a termination signal
+    await bot.stop()
+
 if __name__ == "__main__":
-    # Start Flask in background thread
+    # 1. Start Flask web server in a background thread for Render's port binding health-check
     threading.Thread(target=run_flask, daemon=True).start()
 
-    async def main():
-        print(f"DEBUG: Active DB_CHANNEL_ID = {DB_CHANNEL_ID}")
-        await bot.start()
-        try:
-            await bot.send_message(OWNER_ID, f"**bot started successfully with ForceSub & Web Service ✅**\n\n**Configured Channel ID:** `{DB_CHANNEL_ID}`")
-        except Exception:
-            pass
-        await idle()
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    # 2. Use modern asyncio.run() which cleanly handles loop creation and lifecycle management
+    asyncio.run(main())
