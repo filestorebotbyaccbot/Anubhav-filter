@@ -1,4 +1,15 @@
+# =====================================================================
+# EXTRA PATCH FOR PYTHON 3.14+ (MUST BE AT THE VERY TOP OF THE FILE)
 import asyncio
+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    # This tricks Pyrogram into finding a valid loop during its import phase
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+# =====================================================================
+
 import os
 import threading
 from pyrogram import Client, filters, idle
@@ -21,7 +32,6 @@ bot = Client(
 )
 
 def run_flask():
-    # Flask for Render keep-alive
     app.run(host='0.0.0.0', port=8080)
 
 # Real-time Channel Indexing handler
@@ -31,7 +41,6 @@ async def channel_index_handler(client, message):
     file_id = media.file_id
     file_name = getattr(media, "file_name", "document_file")
 
-    # Only index .mkv files as per user request
     if not file_name.lower().endswith(".mkv"):
         return
 
@@ -114,28 +123,16 @@ async def file_callback_handler(client, cb):
         print(f"File Send Error: {e}")
         await cb.answer("Error sending file", show_alert=True)
 
-
-# --- FIX APPLIED HERE ---
 async def main():
     print(f"DEBUG: Active DB_CHANNEL_ID = {DB_CHANNEL_ID}")
-    
-    # Start Pyrogram client asynchronously
     await bot.start()
-    
     try:
         await bot.send_message(OWNER_ID, f"**bot started successfully with ForceSub & Web Service ✅**\n\n**Configured Channel ID:** `{DB_CHANNEL_ID}`")
     except Exception:
         pass
-        
-    # Keep the bot running asynchronously 
     await idle()
-    
-    # Gracefully stop the bot if the process receives a termination signal
     await bot.stop()
 
 if __name__ == "__main__":
-    # 1. Start Flask web server in a background thread for Render's port binding health-check
     threading.Thread(target=run_flask, daemon=True).start()
-
-    # 2. Use modern asyncio.run() which cleanly handles loop creation and lifecycle management
     asyncio.run(main())
