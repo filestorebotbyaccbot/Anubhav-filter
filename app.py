@@ -7,6 +7,4 @@ def hello_world():
     return 'CineVerse Ultra Bot is running!'
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=8080)
