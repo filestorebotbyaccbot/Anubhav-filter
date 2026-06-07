@@ -1,0 +1,614 @@
+import asyncio
+import re
+import time  
+import math  
+import random  
+from bson.objectid import ObjectId
+from pyrogram import Client, filters, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from fuzzywuzzy import process, fuzz
+
+# External files se imports
+from info import *
+from utils import *
+from plugins.generate import database
+
+# Admin state track karne ke liye global dictionary
+ADMIN_STATES = {}
+
+# Background message deletion helper (Users ke liye group me)
+async def safe_delete_message(msg, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+# डेटाबेस में एक साथ सारे एपिसोड्स सेव करने का हेल्पर फंक्शन
+async def save_bulk_stories_to_db(bot, message, user_id):
+    state = ADMIN_STATES[user_id]
+    
+    # UI क्लीन करने के लिए 'Step 3' वाला आखरी इंस्ट्रक्शन मैसेज डिलीट करना
+    if "last_msg_id" in state:
+        try:
+            await bot.delete_messages(chat_id=message.chat.id, message_ids=state["last_msg_id"])
+        except Exception:
+            pass
+            
+    try:
+        success_count = 0
+        inserted_details = ""
+        preview_buttons = []
+        
+        # Har line se episode aur link nikal kar save karna
+        for ep_data in state["episodes_list"]:
+            database.posts.insert_one({
+                "title": state["keyword"],
+                "display_name": ep_data["name"],
+                "link": ep_data["link"],
+                "photo_id": state.get("photo_id")  # Sabhi episodes me same poster attach ho jayega
+            })
+            success_count += 1
+            inserted_details += f"• `{ep_data['name']}` ➜ [Link]({ep_data['link']})\n"
+            preview_buttons.append([InlineKeyboardButton(f"📖 {ep_data['name']}", url=ep_data['link'])])
+            
+        caption = (
+            "🎉 **Sᴛ0ʀY & Aʟʟ Bᴜᴛᴛ0ɴs Aᴅᴅᴇᴅ SᴜᴄᴄᴇssғᴜʟLʏ!**\n\n"
+            f"🎬 **Sᴛ0ʀY Nᴀᴍᴇ:** `{state['keyword'].title()}`\n"
+            f"📦 **T0ᴛAʟ Bᴜᴛᴛ0ɴs:** `{success_count}`\n\n"
+            f"**Lɪsᴛ 0ғ Aᴅᴅᴇᴅ Eᴘɪs0ᴅᴇs:**\n{inserted_details}"
+        )
+        
+        if state.get("photo_id"):
+            await bot.send_photo(chat_id=message.chat.id, photo=state["photo_id"], caption=caption, reply_markup=InlineKeyboardMarkup(preview_buttons))
+        else:
+            await bot.send_message(chat_id=message.chat.id, text=caption, reply_markup=InlineKeyboardMarkup(preview_buttons), disable_web_page_preview=True)
+            
+    except Exception as e:
+        await bot.send_message(chat_id=message.chat.id, text=f"❌ **EʀR0ʀ sᴀᴠɪɴɢ ᴛ0 DB:** {e}")
+    
+    # Process complete hone par state clear karein
+    ADMIN_STATES.pop(user_id, None)
+
+
+# =====================================================================
+# 1. 📩 REQUEST COMMAND
+# =====================================================================
+@Client.on_message(filters.command("request"))
+async def request_cmd(bot, message):
+    if len(message.command) < 2:
+        return await message.reply_text(
+            "<b>⚠️ UsᴀGᴇ Iɴsᴛʀᴜᴄᴛɪ0ɴ:</b>\n\n"
+            "<code>/request Story Name</code>\n\n"
+            "<i>PʟᴇAsᴇ ᴘʀ0ᴠɪᴅE ᴀ sᴛ0ʀY ɴAᴍE!</i>",
+            quote=True
+        )
+    
+    query = message.text.split(None, 1)[1]
+    
+    try:
+        await bot.send_message(
+            chat_id=LOG_CHANNEL, 
+            text=(
+                f"📩 **NᴇW Sᴛ0ʀY RᴇǫᴜEsᴛ**\n\n"
+                f"👤 **Fʀ0ᴍ:** {message.from_user.mention if message.from_user else 'Anonymous'}\n"
+                f"🆔 **ID:** `{message.from_user.id if message.from_user else 'N/A'}`\n"
+                f"📝 **Sᴛ0ʀY:** `{query}`"
+            )
+        )
+        await message.reply_text(f"✅ **Y0ᴜR RᴇǫᴜEsᴛ HᴀS BᴇEɴ SᴇNᴛ!**\n\nSᴛ0ʀY: ` {query.title()} `")
+    except Exception as e:
+        print(f"Request Log Error: {e}")
+        await message.reply_text("❌ **EʀR0r:** RᴇǫᴜEsᴛ ɴ0ᴛ sᴇɴᴛ. CʜEᴄK LOG_CHANNEL ID!")
+
+
+# =====================================================================
+# 2. ➕ ADMIN COMMAND: CLEAN UI BULK STORY ADDER
+# =====================================================================
+@Client.on_message(filters.command("add_story") & filters.user(ADMIN))
+async def add_story_cmd(bot, message):
+    try: await message.delete() 
+    except Exception: pass
+
+    ADMIN_STATES[message.from_user.id] = {"step": "keyword", "episodes_list": []}
+    cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ CᴀɴCᴇʟ Pʀ0ᴄᴇss", callback_data="cancel_add")]])
+    
+    msg = await bot.send_message(
+        chat_id=message.chat.id,
+        text="👋 **WELC0ME T0 BULK STORY ADDER!**\n\n"
+             "📝 **SᴛEᴘ 1:** Please enter the **Main Story Name / Search Keyword** (e.g., `pariyon ki kahani`):",
+        reply_markup=cancel_markup
+    )
+    ADMIN_STATES[message.from_user.id]["last_msg_id"] = msg.id
+
+@Client.on_message(filters.private & filters.user(ADMIN) & filters.text & ~filters.command(["start", "help", "add_story", "del_story"]))
+async def handle_story_inputs(bot, message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_STATES:
+        return 
+
+    state = ADMIN_STATES[user_id]
+    current_step = state["step"]
+    cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ CᴀɴCᴇLs Pʀ0... ", callback_data="cancel_add")]])
+
+    try: await message.delete()
+    except Exception: pass
+
+    if "last_msg_id" in state:
+        try: await bot.delete_messages(chat_id=message.chat.id, message_ids=state["last_msg_id"])
+        except Exception: pass
+
+    if current_step == "keyword":
+        state["keyword"] = message.text.lower().strip()
+        state["step"] = "photo"
+        
+        skip_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭️ SᴋIᴘ Pʜ0ᴛ0 (UsE BᴀCᴋᴜP)", callback_data="skip_photo")],
+            [InlineKeyboardButton("❌ CᴀɴCᴇLs Pʀ0...", callback_data="cancel_add")]
+        ])
+        msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text=f"✅ Sᴛ0ʀY NᴀMᴇ SᴀVᴇD: `{state['keyword'].title()}`\n\n"
+                 "🖼️ **SᴛEᴘ 2:** Please send the **Story Poster / Image**:\n"
+                 "_(Direct photo bhejें ya link text me bhejें)_",
+            reply_markup=skip_markup
+        )
+        state["last_msg_id"] = msg.id
+
+    elif current_step == "photo":
+        state["photo_id"] = message.text.strip()
+        state["step"] = "episodes"
+        msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text="✅ P0sᴛEʀ SᴀVᴇD!\n\n"
+                 "📝 **SᴛEᴘ 3: SᴇNᴅ MᴜLᴛɪPʟEs Eᴘɪs0ᴅEs (Bulk Format)**\n\n"
+                 "Ek sath saare episodes send karein (Har line par naya button):\n\n"
+                 "`Episode 1 | https://t.me/link1`n"
+                 "`Episode 2 | https://t.me/link2`n"
+                 "`Episode 3 | https://t.me/link3`",
+            reply_markup=cancel_markup
+        )
+        state["last_msg_id"] = msg.id
+
+    elif current_step == "episodes":
+        lines = [line.strip() for line in message.text.split("\n") if line.strip()]
+        valid_episodes = []
+        
+        for line in lines:
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 2 and parts[1].startswith("http"):
+                valid_episodes.append({"name": parts[0], "link": parts[1]})
+        
+        if not valid_episodes:
+            msg = await bot.send_message(
+                chat_id=message.chat.id,
+                text="❌ **Format Error!** Kripya is format me bhejein:\n`Episode Name | https://link`",
+                reply_markup=cancel_markup
+            )
+            state["last_msg_id"] = msg.id
+            return
+            
+        state["episodes_list"] = valid_episodes
+        await save_bulk_stories_to_db(bot, message, user_id)
+
+@Client.on_message(filters.private & filters.photo & filters.user(ADMIN))
+async def handle_story_photo(bot, message):
+    user_id = message.from_user.id
+    if user_id in ADMIN_STATES and ADMIN_STATES[user_id]["step"] == "photo":
+        state = ADMIN_STATES[user_id]
+        
+        try: await message.delete()
+        except Exception: pass
+
+        if "last_msg_id" in state:
+            try: await bot.delete_messages(chat_id=message.chat.id, message_ids=state["last_msg_id"])
+            except Exception: pass
+
+        state["photo_id"] = message.photo.file_id
+        state["step"] = "episodes"
+        
+        cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ CᴀɴCᴇLs Pʀ0...", callback_data="cancel_add")]])
+        msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text="✅ P0sᴛEʀ IᴍAɢE SᴀVᴇD!\n\n"
+                 "📝 **SᴛEᴘ 3: SᴇNᴅ MᴜLᴛɪPʟEs Eᴘɪs0ᴅEs (Bulk Format)**\n\n"
+                 "Ab ek sath saare episodes send karein (Har line par naya button):\n\n"
+                 "`Episode 1 | https://t.me/link1`n"
+                 "`Episode 2 | https://t.me/link2`n"
+                 "`Episode 3 | https://t.me/link3`",
+            reply_markup=cancel_markup
+        )
+        state["last_msg_id"] = msg.id
+
+
+# =====================================================================
+# 3. 🗑️ ADMIN COMMAND: DELETE SINGLE OR ALL BUTTONS AT ONCE
+# =====================================================================
+@Client.on_message(filters.command("del_story") & filters.user(ADMIN))
+async def del_story_cmd(bot, message):
+    try: await message.delete()
+    except Exception: pass
+
+    if len(message.command) < 2:
+        msg = await message.reply_text("<b>⚠️ UsᴀGᴇ F0ʀᴍAᴛ:</b>\n<code>/del_story keyword</code>")
+        asyncio.create_task(safe_delete_message(msg, 15))
+        return
+        
+    query = message.text.split(None, 1)[1].lower().strip()
+    db_results = list(database.posts.find({"title": query}))
+    
+    if not db_results:
+        msg = await message.reply_text("❌ Is keyword ka koi bhi button database mein nahi mila.")
+        asyncio.create_task(safe_delete_message(msg, 15))
+        return
+        
+    del_buttons = []
+    if len(db_results) > 1:
+        del_buttons.append([InlineKeyboardButton(f"🚨 DELETE ALL ({len(db_results)} Buttons)", callback_data=f"delall_{query[:30]}")])
+        
+    for post in db_results:
+        del_buttons.append([InlineKeyboardButton(f"🗑️ Delete: {post['display_name']}", callback_data=f"delbtn_{post['_id']}")])
+        
+    await message.reply_text(
+        f"👇 **KɪS ʙᴜᴛᴛ0ɴ ᴋ0 ᴅᴇʟEᴛE ᴋAʀɴA ʜAɪ ᴄʟIᴄK ᴋAʀᴇIɴ:**\n", 
+        reply_markup=InlineKeyboardMarkup(del_buttons)
+    )
+
+
+# =====================================================================
+# 4. 🔍 MAIN AUTO-FILTER / SEARCH LOGIC (Auto Photo Display & Smart Regex)
+# =====================================================================
+@Client.on_message(filters.text & filters.group & filters.incoming & ~filters.command(["verify", "connect", "id", "index", "ready", "list", "request", "add_story", "del_story"]))
+async def search(bot, message):
+    if message.text.startswith("/"): return
+    original_query = message.text.lower().strip()
+    if len(original_query) < 3: return 
+
+    start_time = time.time()
+    backup_photo = globals().get('BACKUP_PHOTO', "https://i.ibb.co/bRF7VnK9/photo-2026-04-30-08-44-00-7634470373420957700.jpg")
+    suggestion_photo = "https://i.ibb.co/kVYWwBQJ/photo-2026-04-22-13-45-49-7631579452408856584.jpg"
+
+    # --- यूज़र के मैसेज से एपिसोड नंबर निकालना ---
+    query = original_query
+    target_ep = None
+    
+    ep_match = re.search(r"(?:ep|episode)\s*(\d+)", query)
+    if ep_match:
+        target_ep = int(ep_match.group(1)) 
+        query = re.sub(r"(?:ep|episode)\s*\d+", "", query).strip()
+
+    keywords = query.split()
+    regex_pattern = ".*".join(map(re.escape, keywords))
+    
+    try:
+        db_results = list(database.posts.find({"title": {"$regex": regex_pattern, "$options": "i"}}))
+    except Exception: 
+        return
+
+    # --- रेंज के हिसाब से बटन फिल्टर करना ---
+    if target_ep is not None and db_results:
+        filtered_results = []
+        for post in db_results:
+            btn_text = post['display_name']
+            range_match = re.search(r"(\d+)\s*(?:to|-)\s*(\d+)", btn_text, re.IGNORECASE)
+            
+            if range_match:
+                start_ep = int(range_match.group(1))
+                end_ep = int(range_match.group(2))
+                if start_ep <= target_ep <= end_ep:
+                    filtered_results.append(post)
+                    break 
+            else:
+                single_match = re.search(r"\b(\d+)\b", btn_text)
+                if single_match and int(single_match.group(1)) == target_ep:
+                    filtered_results.append(post)
+                    break
+                    
+        if filtered_results:
+            db_results = filtered_results
+        else:
+            db_results = []
+
+    safe_cb_query = query[:20].strip()
+
+    if db_results:
+        try:
+            await message.react(emoji=random.choice(REACTION_DIRECT), big=True)
+        except Exception:
+            await message.react(emoji="⚡️", big=True)
+            pass
+            
+        story_buttons = []
+        photo = None
+        
+        displayed_results = db_results[:10]
+        for post in displayed_results:
+            if not photo and post.get("photo_id"):
+                photo = post.get("photo_id")
+            story_buttons.append([InlineKeyboardButton(f"📖 {post['display_name']}", url=post['link'], style=enums.ButtonStyle.DANGER)])
+            
+        total_pages = math.ceil(len(db_results) / 10)
+        if total_pages > 1:
+            story_buttons.append([
+                InlineKeyboardButton("Pᴀɢᴇ", callback_data="noop", style=enums.ButtonStyle.PRIMARY),
+                InlineKeyboardButton(f"1/{total_pages}", callback_data="noop", style=enums.ButtonStyle.SUCCESS),
+                InlineKeyboardButton("Nᴇxᴛ ➡️", callback_data=f"pag_1_{safe_cb_query}", style=enums.ButtonStyle.PRIMARY)
+            ])
+            
+        story_buttons.append([InlineKeyboardButton("⚠️ RᴇP0ʀT Bʀ0ᴋEɴ LɪNᴋ", callback_data=f"report_{safe_cb_query}", style=enums.ButtonStyle.SUCCESS)])
+        story_buttons.append([
+            InlineKeyboardButton("📢 STORY CHANNEL", url="https://t.me/freestoryhubMR", style=enums.ButtonStyle.PRIMARY),
+            InlineKeyboardButton("💬 REQUEST GROUP", url="https://t.me/pratilipifm0900", style=enums.ButtonStyle.PRIMARY)
+        ])
+        
+        elapsed_time = round(time.time() - start_time, 2)
+        group_name = message.chat.title if message.chat.title else "Story Group"
+
+        caption = (
+            f"☠️ <b>Sᴛ0ʀY TɪTʟE:-</b> {query.title()}\n"
+            f"📝 <b>RᴇǫᴜEsᴛᴇ∂ BY:-</b> {message.from_user.mention if message.from_user else 'User'}\n"
+            f"⏰ <b>RᴇsᴜLᴛ TɪMᴇ:-</b> {elapsed_time} sᴇᴄ0ɴDS\n"
+            f"📁 <b>Gʀ0ᴜP NᴀᴍE:-</b> {group_name}\n\n"
+            f"тнιѕ мєѕѕαgє ωιℓℓ вє αυтσмαтι¢αℓℓу ∂єℓєтє∂ ιη 5 мιηυтєѕ..!"
+        )
+        
+        try:
+            msg = await message.reply_photo(photo=photo if photo else backup_photo, caption=caption, reply_markup=InlineKeyboardMarkup(story_buttons))
+        except Exception:
+            msg = await message.reply_photo(photo=backup_photo, caption=caption, reply_markup=InlineKeyboardMarkup(story_buttons))
+            
+        asyncio.create_task(safe_delete_message(msg, 300))
+        return
+
+    # --- Suggestion System ---
+    try:
+        all_titles = database.posts.distinct("title")
+    except Exception: return
+
+    if all_titles:
+        matches = process.extract(query, all_titles, limit=6, scorer=fuzz.token_set_ratio)
+        suggestion_buttons = [[InlineKeyboardButton(f"🎬 {title.title()}", callback_data=f"fuzzy_{title[:25]}")] 
+                              for title, score in matches if score > 55]
+        
+        if suggestion_buttons:
+            try:
+                await message.react(emoji=random.choice(REACTION_FUZZY), big=True)
+            except Exception:
+                await message.react(emoji="🤔", big=True)
+                pass
+
+            suggestion_buttons.append([InlineKeyboardButton("❓ H0ᴡ T0 RᴇǫᴜEsᴛ?", callback_data="how_to_req", style=enums.ButtonStyle.PRIMARY)])
+        try:
+            msg = await message.reply_photo(
+                photo=suggestion_photo, 
+                caption=f"<b>🔻 I C0ᴜ Lᴅ N0ᴛ FɪNᴅ Aɴ ExᴀCᴛ MᴀTᴄH F0ʀ '{original_query}'.\n\nDɪD Y0ᴜ MᴇAɴ OɴE Oғ TʜEsᴇ?</b>", 
+                reply_markup=InlineKeyboardMarkup(suggestion_buttons)
+            )
+            asyncio.create_task(safe_delete_message(msg, 300))
+        except Exception: 
+            pass
+
+
+# =====================================================================
+# 5. 🎛️ CALLBACK HANDLER
+# =====================================================================
+@Client.on_callback_query(filters.regex(r"^(fuzzy|how_to_req|report_|delbtn_|delall_|pag_|fpag_|noop|cancel_add|skip_photo)"))
+async def cb_handler(bot, update):
+    data = update.data
+    user_id = update.from_user.id
+    
+    if data == "noop":
+        return await update.answer()
+        
+    if data == "cancel_add":
+        if user_id in ADMIN_STATES and "last_msg_id" in ADMIN_STATES[user_id]:
+            try: await bot.delete_messages(chat_id=update.message.chat.id, message_ids=ADMIN_STATES[user_id]["last_msg_id"])
+            except Exception: pass
+        ADMIN_STATES.pop(user_id, None)
+        return await update.answer("❌ Process Cancelled & Cleaned!", show_alert=True)
+
+    elif data == "skip_photo":
+        if user_id in ADMIN_STATES and ADMIN_STATES[user_id]["step"] == "photo":
+            state = ADMIN_STATES[user_id]
+            
+            try: await update.message.delete()
+            except Exception: pass
+            
+            state["photo_id"] = None
+            state["step"] = "episodes"
+            
+            cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ CᴀɴCᴇLs Pʀ0...", callback_data="cancel_add")]])
+            msg = await bot.send_message(
+                chat_id=update.message.chat.id,
+                text="⏭️ Photo skipped! (Backup image use hogi).\n\n"
+                     "📝 **SᴛEᴘ 3: SᴇNᴅ MᴜLᴛɪPʟEs Eᴘɪs0ᴅEs (Bulk Format)**\n\n"
+                     "Ab ek sath saare episodes send karein (Har line par naya button):\n\n"
+                     "`Episode 1 | https://t.me/link1`n"
+                     "`Episode 2 | https://t.me/link2`n"
+                     "`Episode 3 | https://t.me/link3`",
+                reply_markup=cancel_markup
+            )
+            state["last_msg_id"] = msg.id
+            return await update.answer() # यहाँ से टेक्स्ट हटा दिया
+    
+    elif data.startswith("pag_"):
+        await update.answer() # यहाँ से 'Loading Page...' हटा दिया (अब सिर्फ साइलेंटली लोड होगा)
+        _, page, query_val = data.split("_", 2)
+        page = int(page)
+        
+        keywords = query_val.split()
+        regex_pattern = ".*".join(map(re.escape, keywords))
+        
+        db_results = list(database.posts.find({"title": {"$regex": regex_pattern, "$options": "i"}}))
+        if db_results:
+            story_buttons = []
+            start_idx = page * 10
+            end_idx = start_idx + 10
+            displayed_results = db_results[start_idx:end_idx]
+            
+            for post in displayed_results:
+                story_buttons.append([InlineKeyboardButton(f"📖 {post['display_name']}", url=post['link'], style=enums.ButtonStyle.DANGER)])
+                
+            total_pages = math.ceil(len(db_results) / 10)
+            nav_buttons = []
+            
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton("⬅️ BᴀCᴋ", callback_data=f"pag_{page-1}_{query_val}", style=enums.ButtonStyle.PRIMARY))
+            else:
+                nav_buttons.append(InlineKeyboardButton("Pᴀɢe", callback_data="noop", style=enums.ButtonStyle.SUCCESS))
+                
+            nav_buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop", style=enums.ButtonStyle.PRIMARY))
+            
+            if end_idx < len(db_results):
+                nav_buttons.append(InlineKeyboardButton("Nᴇxᴛ ➡️", callback_data=f"pag_{page+1}_{query_val}", style=enums.ButtonStyle.PRIMARY))
+            else:
+                nav_buttons.append(InlineKeyboardButton("Pᴀɢe", callback_data="noop", style=enums.ButtonStyle.SUCCESS))
+                
+            story_buttons.append(nav_buttons)  
+            story_buttons.append([InlineKeyboardButton("⚠️ RᴇP0ʀT Bʀ0ᴋEɴ LɪNᴋ", callback_data=f"report_{query_val}", style=enums.ButtonStyle.SUCCESS)])
+            story_buttons.append([
+                InlineKeyboardButton("📢 STORY CHANNEL", url="https://t.me/freestoryhubMR", style=enums.ButtonStyle.PRIMARY),
+                InlineKeyboardButton("💬 REQUEST GROUP", url="https://t.me/pratilipifm0900", style=enums.ButtonStyle.PRIMARY)
+            ])
+            
+            try:
+                await update.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(story_buttons))
+            except Exception:
+                pass
+
+    elif data.startswith("fuzzy_"):
+        await update.answer() # यहाँ से 'Fetching Story...' हटा दिया (अब सीधा मैसेज एडिट/सेंड होगा)
+        start_time = time.time()
+        value = data.split("_", 1)[1]
+        
+        db_results = list(database.posts.find({"title": {"$regex": f"^{re.escape(value)}", "$options": "i"}}))
+        safe_value = value[:20].strip()
+
+        if db_results:
+            story_buttons = []
+            photo = None
+            
+            displayed_results = db_results[:10]
+            for post in displayed_results:
+                if not photo and post.get("photo_id"): 
+                    photo = post.get("photo_id")
+                story_buttons.append([InlineKeyboardButton(f"📖 {post['display_name']}", url=post['link'], style=enums.ButtonStyle.DANGER)])
+                
+            total_pages = math.ceil(len(db_results) / 10)
+            if total_pages > 1:
+                story_buttons.append([
+                    InlineKeyboardButton("Pᴀɢe", callback_data="noop", style=enums.ButtonStyle.PRIMARY),
+                    InlineKeyboardButton(f"1/{total_pages}", callback_data="noop", style=enums.ButtonStyle.SUCCESS),
+                    InlineKeyboardButton("Nᴇxᴛ ➡️", callback_data=f"fpag_1_{safe_value}", style=enums.ButtonStyle.PRIMARY)
+                ])
+                
+            story_buttons.append([InlineKeyboardButton("⚠️ RᴇP0ʀT Bʀ0ᴋEɴ LɪNᴋ", callback_data=f"report_{safe_value}", style=enums.ButtonStyle.SUCCESS)])
+            story_buttons.append([
+                InlineKeyboardButton("📢 STORY CHANNEL", url="https://t.me/freestoryhubMR", style=enums.ButtonStyle.PRIMARY),
+                InlineKeyboardButton("💬 REQUEST GROUP", url="https://t.me/pratilipifm0900", style=enums.ButtonStyle.PRIMARY)
+            ])
+            
+            elapsed_time = round(time.time() - start_time, 2)
+            group_name = update.message.chat.title if update.message.chat.title else "Story Group"
+
+            p_caption = (
+                f"☠️ <b>Sᴛ0ʀY TɪTʟE:-</b> {value.title()}\n"
+                f"📝 <b>RᴇǫᴜEsᴛᴇᴅ BY:-</b> {update.from_user.mention if update.from_user else 'User'}\n"
+                f"⏰ <b>RᴇsᴜLᴛ TɪMᴇ:-</b> {elapsed_time} sᴇᴄ0ɴᴅs\n"
+                f"📁 <b>Gʀ0ᴜP NᴀᴍE:-</b> {group_name}\n\n"
+                f"тнιѕ мєѕѕαgє ωιℓℓ вє αυтσмαтι¢αℓℓу ∂єℓєтє∂ ιη 5 мιηυтєѕ..!"
+            )
+            backup_photo = globals().get('BACKUP_PHOTO', "https://i.ibb.co/bRF7VnK9/photo-2026-04-30-08-44-00-7634470373420957700.jpg")
+            try: await update.message.delete()
+            except Exception: pass
+
+            try:
+                new_msg = await bot.send_photo(chat_id=update.message.chat.id, photo=photo if photo else backup_photo, caption=p_caption, reply_markup=InlineKeyboardMarkup(story_buttons))
+                asyncio.create_task(safe_delete_message(new_msg, 300))
+            except Exception:
+                new_msg = await bot.send_photo(chat_id=update.message.chat.id, photo=backup_photo, caption=p_caption, reply_markup=InlineKeyboardMarkup(story_buttons))
+                asyncio.create_task(safe_delete_message(new_msg, 300))
+        else:
+            await update.answer("⚠️ S0ʀʀY, Sᴛ0ʀY N0ᴛ F0ᴜNᴅ!", show_alert=True)
+
+    elif data.startswith("fpag_"):
+        await update.answer() # यहाँ से भी 'Loading Page...' हटा दिया
+        _, page, value = data.split("_", 2)
+        page = int(page)
+        
+        db_results = list(database.posts.find({"title": {"$regex": f"^{re.escape(value)}", "$options": "i"}}))
+        if db_results:
+            story_buttons = []
+            start_idx = page * 10
+            end_idx = start_idx + 10
+            displayed_results = db_results[start_idx:end_idx]
+            
+            for post in displayed_results:
+                story_buttons.append([InlineKeyboardButton(f"📖 {post['display_name']}", url=post['link'], style=enums.ButtonStyle.DANGER)])
+                
+            total_pages = math.ceil(len(db_results) / 10)
+            nav_buttons = []
+            
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton("⬅️ BᴀCᴋ", callback_data=f"fpag_{page-1}_{value}", style=enums.ButtonStyle.PRIMARY))
+            else:
+                nav_buttons.append(InlineKeyboardButton("Pᴀɢe", callback_data="noop", style=enums.ButtonStyle.SUCCESS))
+                
+            nav_buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop", style=enums.ButtonStyle.PRIMARY))
+            
+            if end_idx < len(db_results):
+                nav_buttons.append(InlineKeyboardButton("Nᴇxᴛ ➡️", callback_data=f"fpag_{page+1}_{value}", style=enums.ButtonStyle.PRIMARY))
+            else:
+                nav_buttons.append(InlineKeyboardButton("Pᴀɢe", callback_data="noop", style=enums.ButtonStyle.SUCCESS))
+                
+            story_buttons.append(nav_buttons) 
+            story_buttons.append([InlineKeyboardButton("⚠️ RᴇP0ʀT Bʀ0ᴋEɴ LɪNᴋ", callback_data=f"report_{value}", style=enums.ButtonStyle.SUCCESS)])
+            story_buttons.append([
+                InlineKeyboardButton("📢 STORY CHANNEL", url="https://t.me/freestoryhubMR", style=enums.ButtonStyle.PRIMARY),
+                InlineKeyboardButton("💬 REQUEST GROUP", url="https://t.me/pratilipifm0900", style=enums.ButtonStyle.PRIMARY)
+            ])
+            
+            try:
+                await update.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(story_buttons))
+            except Exception:
+                pass
+            
+    elif data == "how_to_req":
+        await update.answer("📝 H0ᴡ T0 RᴇǫᴜEsᴛ:\n\nUse: /request [Story Name]", show_alert=True)
+
+    elif data.startswith("report_"):
+        story_name = data.split("_", 1)[1]
+        try:
+            await bot.send_message(
+                chat_id=LOG_CHANNEL,
+                text=f"⚠️ **Bʀ0ᴋEɴ LɪNᴋ RᴇP0ʀT**\n\n👤 **RᴇP0ʀᴛEᴅ BY:** {update.from_user.mention if update.from_user else 'User'}\n📖 **Sᴛ0ʀY:** `{story_name}`"
+            )
+            await update.answer(f"✅ RᴇP0ʀT SᴇNᴛ T0 Aᴅᴍɪɴ!", show_alert=True)
+        except Exception:
+            await update.answer("❌ Error: Log Channel not found!", show_alert=True)
+
+    elif data.startswith("delbtn_"):
+        btn_id = data.split("_", 1)[1]
+        try:
+            res = database.posts.delete_one({"_id": ObjectId(btn_id)})
+            if res.deleted_count > 0:
+                await update.answer("❌ Button Successfully Deleted From Database!", show_alert=True)
+                try: await update.message.delete()
+                except Exception: pass
+            else:
+                await update.answer("⚠️ Button Already Deleted!", show_alert=True)
+        except Exception as e:
+            await update.answer(f"Error: {e}", show_alert=True)
+
+    elif data.startswith("delall_"):
+        keyword_to_del = data.split("_", 1)[1]
+        try:
+            res = database.posts.delete_many({"title": keyword_to_del})
+            if res.deleted_count > 0:
+                await update.answer(f"💥 Success: All {res.deleted_count} buttons deleted for this story!", show_alert=True)
+                try: await update.message.delete()
+                except Exception: pass
+            else:
+                await update.answer("⚠️ Buttons already deleted!", show_alert=True)
+        except Exception as e:
+            await update.answer(f"Error: {e}", show_alert=True)
